@@ -16,8 +16,8 @@
 package io.vertx.spi.cluster.zookeeper.impl;
 
 import io.vertx.core.*;
-import io.vertx.core.logging.Logger;
-import io.vertx.core.logging.LoggerFactory;
+import io.vertx.core.impl.logging.Logger;
+import io.vertx.core.impl.logging.LoggerFactory;
 import io.vertx.core.spi.cluster.AsyncMultiMap;
 import io.vertx.core.spi.cluster.ChoosableIterable;
 import org.apache.curator.framework.CuratorFramework;
@@ -36,9 +36,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
 
-import static org.apache.curator.framework.recipes.cache.TreeCacheEvent.Type.INITIALIZED;
-import static org.apache.curator.framework.recipes.cache.TreeCacheEvent.Type.NODE_ADDED;
-import static org.apache.curator.framework.recipes.cache.TreeCacheEvent.Type.NODE_REMOVED;
+import static org.apache.curator.framework.recipes.cache.TreeCacheEvent.Type.*;
 
 /**
  * Created by Stream.Liu
@@ -72,7 +70,7 @@ public class ZKAsyncMultiMap<K, V> extends ZKMap<K, V> implements AsyncMultiMap<
     String path = valuePath(k, v);
     assertKeyAndValueAreNotNull(k, v)
       .compose(aVoid -> checkExists(path))
-      .compose(checkResult -> checkResult ? setData(path, v) : create(path, v))
+      .compose(checkResult -> checkResult ? setData(path, v) : create(path, v, Optional.empty()))
       .compose(stat -> {
         //add to snapshot cache if path contains eventbus address
         if (path.contains(EVENTBUS_PATH)) {
@@ -81,7 +79,7 @@ public class ZKAsyncMultiMap<K, V> extends ZKMap<K, V> implements AsyncMultiMap<
           serverIDs.add(v);
           eventBusSnapshotCache.put(path, serverIDs);
         }
-        Future<Void> future = Future.future();
+        Promise<Void> future = Promise.promise();
         try {
           curator.sync().inBackground((syncClient, syncEvent) -> {
             if (syncEvent.getType() == CuratorEventType.SYNC) {
@@ -97,9 +95,9 @@ public class ZKAsyncMultiMap<K, V> extends ZKMap<K, V> implements AsyncMultiMap<
         } catch (Exception ex) {
           vertx.runOnContext(aVoid -> future.fail(ex));
         }
-        return future;
+        return future.future();
       })
-      .setHandler(completionHandler);
+      .onComplete(completionHandler);
   }
 
   @Override
@@ -109,7 +107,7 @@ public class ZKAsyncMultiMap<K, V> extends ZKMap<K, V> implements AsyncMultiMap<
       .compose(aVoid -> {
         final String keyPath = keyPath(k);
         ChoosableSet<V> entries = cache.get(keyPath);
-        Future<ChoosableIterable<V>> future = Future.future();
+        Promise<ChoosableIterable<V>> future = Promise.promise();
         if (entries != null && !entries.isEmpty()) {
           future.complete(entries);
         } else {
@@ -138,9 +136,9 @@ public class ZKAsyncMultiMap<K, V> extends ZKMap<K, V> implements AsyncMultiMap<
             ctx.runOnContext(v -> future.fail(ex));
           }
         }
-        return future;
+        return future.future();
       })
-      .setHandler(ar -> ctx.runOnContext(v -> asyncResultHandler.handle(ar)));
+      .onComplete(ar -> ctx.runOnContext(v -> asyncResultHandler.handle(ar)));
   }
 
   @Override
@@ -150,15 +148,15 @@ public class ZKAsyncMultiMap<K, V> extends ZKMap<K, V> implements AsyncMultiMap<
         String fullPath = valuePath(k, v);
         return remove(keyPath(k), v, fullPath);
       })
-      .setHandler(completionHandler);
+      .onComplete(completionHandler);
   }
 
   private Future<Boolean> remove(String keyPath, V v, String fullPath) {
     return checkExists(fullPath).compose(checkResult -> {
-      Future<Boolean> future = Future.future();
+      Promise<Boolean> future = Promise.promise();
       if (checkResult) {
         Optional.ofNullable(treeCache.getCurrentData(fullPath))
-          .ifPresent(childData -> delete(fullPath, null).setHandler(deleteResult -> {
+          .ifPresent(childData -> delete(fullPath, null).onComplete(deleteResult -> {
             //delete snapshot cache if keyPath contains event bus address
             if (keyPath.contains(EVENTBUS_PATH)) {
               Optional.ofNullable(eventBusSnapshotCache.get(keyPath)).ifPresent(vs -> {
@@ -171,7 +169,7 @@ public class ZKAsyncMultiMap<K, V> extends ZKMap<K, V> implements AsyncMultiMap<
       } else {
         future.complete(false);
       }
-      return future;
+      return future.future();
     });
   }
 
@@ -204,34 +202,34 @@ public class ZKAsyncMultiMap<K, V> extends ZKMap<K, V> implements AsyncMultiMap<
       });
       //
       CompositeFuture.all(futures).compose(compositeFuture -> {
-        Future<Void> future = Future.future();
+        Promise<Void> future = Promise.promise();
         future.complete();
-        return future;
-      }).setHandler(completionHandler);
+        return future.future();
+      }).onComplete(completionHandler);
     });
   }
 
   private Future<Void> restoreSnapshotCache() {
-    Future<Void> futureResult = Future.future();
+    Promise<Void> futureResult = Promise.promise();
     List<Future> allFuture = eventBusSnapshotCache.entrySet().stream().map(entry -> {
       String path = entry.getKey().substring(mapPath.length() + 1).split("/", 2)[0];
       ChoosableSet<V> values = entry.getValue();
       List<Future> futures = values.getIds().stream().map(value -> {
-        Future<Void> future = Future.future();
-        add((K) path, value, future.completer());
-        return future;
+        Promise<Void> future = Promise.promise();
+        add((K) path, value, future);
+        return future.future();
       }).collect(Collectors.toList());
       return futures;
     }).flatMap(Collection::stream).collect(Collectors.toList());
 
-    CompositeFuture.all(allFuture).setHandler(event -> {
+    CompositeFuture.all(allFuture).onComplete(event -> {
       if (event.failed()) {
         futureResult.fail(event.cause());
       } else {
         futureResult.complete();
       }
     });
-    return futureResult;
+    return futureResult.future();
   }
 
   private class Listener implements TreeCacheListener {
@@ -282,7 +280,7 @@ public class ZKAsyncMultiMap<K, V> extends ZKMap<K, V> implements AsyncMultiMap<
           //if reconnect status is true, we try to restore eventbus address information to the zookeeper cluster
           if (reconnected.get()) {
             reconnected.set(false);
-            restoreSnapshotCache().setHandler(event -> {
+            restoreSnapshotCache().onComplete(event -> {
               if (event.failed()) {
                 logger.error("restore eventbus snapshot cache failed.", event.cause());
               } else {

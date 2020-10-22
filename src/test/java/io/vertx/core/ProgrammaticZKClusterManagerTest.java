@@ -1,10 +1,25 @@
-package io.vertx.test.core;
+/*
+ * Copyright 2018 Red Hat, Inc.
+ *
+ * Red Hat licenses this file to you under the Apache License, version 2.0
+ * (the "License"); you may not use this file except in compliance with the
+ * License.  You may obtain a copy of the License at:
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations
+ * under the License.
+ */
 
-import io.vertx.core.Vertx;
-import io.vertx.core.VertxOptions;
+package io.vertx.core;
+
 import io.vertx.core.json.JsonObject;
 import io.vertx.spi.cluster.zookeeper.MockZKCluster;
 import io.vertx.spi.cluster.zookeeper.ZookeeperClusterManager;
+import io.vertx.test.core.AsyncTestBase;
 import org.apache.curator.RetryPolicy;
 import org.apache.curator.framework.CuratorFramework;
 import org.apache.curator.framework.CuratorFrameworkFactory;
@@ -27,7 +42,7 @@ public class ProgrammaticZKClusterManagerTest extends AsyncTestBase {
   private void testProgrammatic(ZookeeperClusterManager mgr, JsonObject config) throws Exception {
     mgr.setConfig(config);
     assertEquals(config, mgr.getConfig());
-    VertxOptions options = new VertxOptions().setClusterManager(mgr).setClustered(true);
+    VertxOptions options = new VertxOptions().setClusterManager(mgr);
     Vertx.clusteredVertx(options, res -> {
       assertTrue(res.succeeded());
       assertNotNull(mgr.getCuratorFramework());
@@ -83,8 +98,8 @@ public class ProgrammaticZKClusterManagerTest extends AsyncTestBase {
 
     ZookeeperClusterManager mgr1 = new ZookeeperClusterManager(curator1);
     ZookeeperClusterManager mgr2 = new ZookeeperClusterManager(curator2);
-    VertxOptions options1 = new VertxOptions().setClusterManager(mgr1).setClustered(true).setClusterHost("127.0.0.1");
-    VertxOptions options2 = new VertxOptions().setClusterManager(mgr2).setClustered(true).setClusterHost("127.0.0.1");
+    VertxOptions options1 = new VertxOptions().setClusterManager(mgr1).setClusterHost("127.0.0.1");
+    VertxOptions options2 = new VertxOptions().setClusterManager(mgr2).setClusterHost("127.0.0.1");
 
     AtomicReference<Vertx> vertx1 = new AtomicReference<>();
     AtomicReference<Vertx> vertx2 = new AtomicReference<>();
@@ -141,8 +156,8 @@ public class ProgrammaticZKClusterManagerTest extends AsyncTestBase {
 
     ZookeeperClusterManager mgr1 = new ZookeeperClusterManager(curator1);
     ZookeeperClusterManager mgr2 = new ZookeeperClusterManager(curator2);
-    VertxOptions options1 = new VertxOptions().setClusterManager(mgr1).setClustered(true).setClusterHost("127.0.0.1");
-    VertxOptions options2 = new VertxOptions().setClusterManager(mgr2).setClustered(true).setClusterHost("127.0.0.1");
+    VertxOptions options1 = new VertxOptions().setClusterManager(mgr1).setClusterHost("127.0.0.1");
+    VertxOptions options2 = new VertxOptions().setClusterManager(mgr2).setClusterHost("127.0.0.1");
 
     AtomicReference<Vertx> vertx1 = new AtomicReference<>();
     AtomicReference<Vertx> vertx2 = new AtomicReference<>();
@@ -199,7 +214,7 @@ public class ProgrammaticZKClusterManagerTest extends AsyncTestBase {
     String nodeID = UUID.randomUUID().toString();
 
     ZookeeperClusterManager mgr = new ZookeeperClusterManager(curator, nodeID);
-    VertxOptions options = new VertxOptions().setClusterManager(mgr).setClustered(true).setClusterHost("127.0.0.1");
+    VertxOptions options = new VertxOptions().setClusterManager(mgr).setClusterHost("127.0.0.1");
 
     AtomicReference<Vertx> vertx1 = new AtomicReference<>();
 
@@ -265,8 +280,8 @@ public class ProgrammaticZKClusterManagerTest extends AsyncTestBase {
 
     ZookeeperClusterManager mgr1 = new ZookeeperClusterManager(curator1);
     ZookeeperClusterManager mgr2 = new ZookeeperClusterManager(curator2);
-    VertxOptions options1 = new VertxOptions().setClusterManager(mgr1).setClustered(true).setClusterHost("127.0.0.1");
-    VertxOptions options2 = new VertxOptions().setClusterManager(mgr2).setClustered(true).setClusterHost("127.0.0.1");
+    VertxOptions options1 = new VertxOptions().setClusterManager(mgr1).setClusterHost("127.0.0.1");
+    VertxOptions options2 = new VertxOptions().setClusterManager(mgr2).setClusterHost("127.0.0.1");
 
     AtomicReference<Vertx> vertx1 = new AtomicReference<>();
     AtomicReference<Vertx> vertx2 = new AtomicReference<>();

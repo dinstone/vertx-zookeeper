@@ -16,17 +16,16 @@
 package io.vertx.spi.cluster.zookeeper.impl;
 
 import io.vertx.core.*;
-import io.vertx.core.json.JsonObject;
+import io.vertx.core.impl.VertxInternal;
 import io.vertx.core.shareddata.AsyncMap;
 import org.apache.curator.framework.CuratorFramework;
 import org.apache.curator.framework.recipes.cache.ChildData;
 import org.apache.curator.framework.recipes.cache.PathChildrenCache;
 import org.apache.zookeeper.data.Stat;
 
+import java.io.IOException;
 import java.time.Instant;
-import java.util.Optional;
-
-import static io.vertx.spi.cluster.zookeeper.impl.AsyncMapTTLMonitor.*;
+import java.util.*;
 
 /**
  * Created by Stream.Liu
@@ -34,13 +33,11 @@ import static io.vertx.spi.cluster.zookeeper.impl.AsyncMapTTLMonitor.*;
 public class ZKAsyncMap<K, V> extends ZKMap<K, V> implements AsyncMap<K, V> {
 
   private final PathChildrenCache curatorCache;
-  private AsyncMapTTLMonitor<K, V> asyncMapTTLMonitor;
 
-  public ZKAsyncMap(Vertx vertx, CuratorFramework curator, AsyncMapTTLMonitor<K,V> asyncMapTTLMonitor, String mapName) {
+  public ZKAsyncMap(Vertx vertx, CuratorFramework curator, String mapName) {
     super(curator, vertx, ZK_PATH_ASYNC_MAP, mapName);
     this.curatorCache = new PathChildrenCache(curator, mapPath, true);
     try {
-      this.asyncMapTTLMonitor = asyncMapTTLMonitor;
       curatorCache.start(PathChildrenCache.StartMode.BUILD_INITIAL_CACHE);
     } catch (Exception e) {
       throw new VertxException(e);
@@ -48,154 +45,117 @@ public class ZKAsyncMap<K, V> extends ZKMap<K, V> implements AsyncMap<K, V> {
   }
 
   @Override
-  public void get(K k, Handler<AsyncResult<V>> asyncResultHandler) {
-    assertKeyIsNotNull(k)
+  public Future<V> get(K k) {
+    return assertKeyIsNotNull(k)
       .compose(aVoid -> checkExists(k))
       .compose(checkResult -> {
-        Future<V> future = Future.future();
+        Promise<V> promise = Promise.promise();
         if (checkResult) {
           ChildData childData = curatorCache.getCurrentData(keyPath(k));
           if (childData != null && childData.getData() != null) {
             try {
               V value = asObject(childData.getData());
-              future.complete(value);
+              promise.complete(value);
             } catch (Exception e) {
-              future.fail(e);
+              promise.fail(e);
             }
           } else {
-            future.complete();
+            promise.complete();
           }
         } else {
           //ignore
-          future.complete();
+          promise.complete();
         }
-        return future;
-      })
-      .setHandler(asyncResultHandler);
+        return promise.future();
+      });
   }
 
   @Override
-  public void put(K k, V v, Handler<AsyncResult<Void>> completionHandler) {
-    put(k, v, Optional.empty(), completionHandler);
+  public Future<Void> put(K k, V v) {
+    return put(k, v, Optional.empty());
   }
 
   @Override
-  public void put(K k, V v, long timeout, Handler<AsyncResult<Void>> completionHandler) {
-    put(k, v, Optional.of(timeout), completionHandler);
+  public Future<Void> put(K k, V v, long ttl) {
+    return put(k, v, Optional.of(ttl));
   }
 
-  private void put(K k, V v, Optional<Long> timeoutOptional, Handler<AsyncResult<Void>> completionHandler) {
-    assertKeyAndValueAreNotNull(k, v)
+  private Future<Void> put(K k, V v, Optional<Long> timeoutOptional) {
+    return assertKeyAndValueAreNotNull(k, v)
       .compose(aVoid -> checkExists(k))
-      .compose(checkResult -> checkResult ? setData(k, v) : create(k, v))
-      .compose(aVoid -> {
-        JsonObject body = new JsonObject().put(TTL_KEY_BODY_KEY_PATH, keyPath(k));
-        if (timeoutOptional.isPresent()) {
-          asyncMapTTLMonitor.addAsyncMapWithPath(keyPath(k), this);
-          body.put(TTL_KEY_BODY_TIMEOUT, timeoutOptional.get());
-        } else body.put(TTL_KEY_IS_CANCEL, true);
-        //publish a ttl message to all nodes.
-        vertx.eventBus().publish(TTL_KEY_HANDLER_ADDRESS, body);
-
-        Future<Void> future = Future.future();
-        future.complete();
-        return future;
-      })
-      .setHandler(completionHandler);
+      .compose(checkResult -> checkResult ? setData(k, v) : create(k, v, timeoutOptional))
+      .compose(stat -> Future.succeededFuture());
   }
 
   @Override
-  public void putIfAbsent(K k, V v, Handler<AsyncResult<V>> completionHandler) {
-    putIfAbsent(k, v, Optional.empty(), completionHandler);
+  public Future<V> putIfAbsent(K k, V v) {
+    return putIfAbsent(k, v, Optional.empty());
   }
 
   @Override
-  public void putIfAbsent(K k, V v, long timeout, Handler<AsyncResult<V>> completionHandler) {
-    putIfAbsent(k, v, Optional.of(timeout), completionHandler);
+  public Future<V> putIfAbsent(K k, V v, long ttl) {
+    return putIfAbsent(k, v, Optional.of(ttl));
   }
 
-  private void putIfAbsent(K k, V v, Optional<Long> timeoutOptional, Handler<AsyncResult<V>> completionHandler) {
-    assertKeyAndValueAreNotNull(k, v)
-      .compose(aVoid -> {
-        Future<V> innerFuture = Future.future();
-        vertx.executeBlocking(future -> {
-          long startTime = Instant.now().toEpochMilli();
-          int retries = 0;
-
-          for (; ; ) {
-            try {
-              Stat stat = new Stat();
-              String path = keyPath(k);
-              V currentValue = getData(stat, path);
-              if (compareAndSet(startTime, retries++, stat, path, currentValue, v)) {
-                future.complete(currentValue);
-                return;
-              }
-            } catch (Exception e) {
-              future.fail(e);
-              return;
-            }
-          }
-        }, false, innerFuture.completer());
-        return innerFuture;
-      })
+  private Future<V> putIfAbsent(K k, V v, Optional<Long> timeoutOptional) {
+    return assertKeyAndValueAreNotNull(k, v)
+      .compose(aVoid -> get(k))
       .compose(value -> {
-        JsonObject body = new JsonObject().put(TTL_KEY_BODY_KEY_PATH, keyPath(k));
-        if (timeoutOptional.isPresent()) {
-          asyncMapTTLMonitor.addAsyncMapWithPath(keyPath(k), this);
-          body.put(TTL_KEY_BODY_TIMEOUT, timeoutOptional.get());
-        } else body.put(TTL_KEY_IS_CANCEL, true);
-        //publish a ttl message to all nodes.
-        vertx.eventBus().publish(TTL_KEY_HANDLER_ADDRESS, body);
+        if (value == null) {
+          if (timeoutOptional.isPresent()) {
+            put(k, v, timeoutOptional);
+          } else {
+            put(k, v);
+          }
+        }
         return Future.succeededFuture(value);
-      })
-      .setHandler(completionHandler);
+      });
   }
 
   @Override
-  public void remove(K k, Handler<AsyncResult<V>> asyncResultHandler) {
-    assertKeyIsNotNull(k).compose(aVoid -> {
-      Future<V> future = Future.future();
-      get(k, future.completer());
-      return future;
+  public Future<V> remove(K k) {
+    return assertKeyIsNotNull(k).compose(aVoid -> {
+      Promise<V> promise = Promise.promise();
+      get(k, promise);
+      return promise.future();
     }).compose(value -> {
-      Future<V> future = Future.future();
+      Promise<V> promise = Promise.promise();
       if (value != null) {
         return delete(k, value);
       } else {
-        future.complete();
+        promise.complete();
       }
-      return future;
-    }).setHandler(asyncResultHandler);
+      return promise.future();
+    });
   }
 
   @Override
-  public void removeIfPresent(K k, V v, Handler<AsyncResult<Boolean>> resultHandler) {
-    assertKeyAndValueAreNotNull(k, v)
+  public Future<Boolean> removeIfPresent(K k, V v) {
+    return assertKeyAndValueAreNotNull(k, v)
       .compose(aVoid -> {
-        Future<V> future = Future.future();
-        get(k, future.completer());
-        return future;
+        Promise<V> promise = Promise.promise();
+        get(k, promise);
+        return promise.future();
       })
       .compose(value -> {
-        Future<Boolean> future = Future.future();
-        if (value.equals(v)) {
-          delete(k, v).setHandler(deleteResult -> {
-            if (deleteResult.succeeded()) future.complete(true);
-            else future.fail(deleteResult.cause());
+        Promise<Boolean> promise = Promise.promise();
+        if (v.equals(value)) {
+          delete(k, v).onComplete(deleteResult -> {
+            if (deleteResult.succeeded()) promise.complete(true);
+            else promise.fail(deleteResult.cause());
           });
         } else {
-          future.complete(false);
+          promise.complete(false);
         }
-        return future;
-      }).setHandler(resultHandler);
+        return promise.future();
+      });
   }
 
   @Override
-  public void replace(K k, V v, Handler<AsyncResult<V>> asyncResultHandler) {
-    assertKeyAndValueAreNotNull(k, v)
+  public Future<V> replace(K k, V v) {
+    return assertKeyAndValueAreNotNull(k, v)
       .compose(aVoid -> {
-        Future<V> innerFuture = Future.future();
+        Promise<V> innerPromise = Promise.promise();
         vertx.executeBlocking(future -> {
           long startTime = Instant.now().toEpochMilli();
           int retries = 0;
@@ -219,19 +179,18 @@ public class ZKAsyncMap<K, V> extends ZKMap<K, V> implements AsyncMap<K, V> {
               return;
             }
           }
-        }, false, innerFuture.completer());
-        return innerFuture;
-      })
-      .setHandler(asyncResultHandler);
+        }, false, innerPromise);
+        return innerPromise.future();
+      });
   }
 
   @Override
-  public void replaceIfPresent(K k, V oldValue, V newValue, Handler<AsyncResult<Boolean>> resultHandler) {
-    assertKeyIsNotNull(k)
+  public Future<Boolean> replaceIfPresent(K k, V oldValue, V newValue) {
+    return assertKeyIsNotNull(k)
       .compose(aVoid -> assertValueIsNotNull(oldValue))
       .compose(aVoid -> assertValueIsNotNull(newValue))
       .compose(aVoid -> {
-        Future<Boolean> innerFuture = Future.future();
+        Promise<Boolean> innerPromise = Promise.promise();
         vertx.executeBlocking(future -> {
           long startTime = Instant.now().toEpochMilli();
           int retries = 0;
@@ -254,33 +213,107 @@ public class ZKAsyncMap<K, V> extends ZKMap<K, V> implements AsyncMap<K, V> {
               return;
             }
           }
-        }, false, innerFuture.completer());
-        return innerFuture;
-      })
-      .setHandler(resultHandler);
+        }, false, innerPromise);
+        return innerPromise.future();
+      });
   }
 
   @Override
-  public void clear(Handler<AsyncResult<Void>> resultHandler) {
+  public Future<Void> clear() {
     //just remove parent node
-    delete(mapPath, null).setHandler(result -> {
-      if (result.succeeded()) {
-        resultHandler.handle(Future.succeededFuture());
-      } else {
-        resultHandler.handle(Future.failedFuture(result.cause()));
+    return delete(mapPath, null).mapEmpty();
+  }
+
+  @Override
+  public Future<Integer> size() {
+    Promise<Integer> promise = ((VertxInternal)vertx).getOrCreateContext().promise();
+    try {
+      curator.getChildren().inBackground((client, event) ->
+        promise.tryComplete(event.getChildren().size()))
+        .forPath(mapPath);
+    } catch (Exception e) {
+      promise.tryFail(e);
+    }
+    return promise.future();
+  }
+
+  @Override
+  public Future<Set<K>> keys() {
+    Promise<Set<K>> promise = ((VertxInternal)vertx).getOrCreateContext().promise();
+    try {
+      curator.getChildren().inBackground((client, event) -> {
+        Set<K> keys = new HashSet<>();
+        for (String base64Key : event.getChildren()) {
+          byte[] binaryKey = Base64.getUrlDecoder().decode(base64Key);
+          K key;
+          try {
+            key = asObject(binaryKey);
+          } catch (Exception e) {
+            promise.tryFail(e);
+            return;
+          }
+          keys.add(key);
+        }
+        promise.tryComplete(keys);
+      }).forPath(mapPath);
+    } catch (Exception e) {
+      promise.tryFail(e);
+    }
+    return promise.future();
+  }
+
+  @Override
+  public Future<List<V>> values() {
+    Promise<Set<K>> keysPromise = ((VertxInternal)vertx).getOrCreateContext().promise();
+    keys(keysPromise);
+    return keysPromise.future().compose(keys -> {
+      List<Future> futures = new ArrayList<>(keys.size());
+      for (K k : keys) {
+        Promise valuePromise = Promise.promise();
+        get(k, valuePromise);
+        futures.add(valuePromise.future());
       }
+      return CompositeFuture.all(futures).map(compositeFuture -> {
+        List<V> values = new ArrayList<>(compositeFuture.size());
+        for (int i = 0; i < compositeFuture.size(); i++) {
+          values.add(compositeFuture.resultAt(i));
+        }
+        return values;
+      });
     });
   }
 
   @Override
-  public void size(Handler<AsyncResult<Integer>> resultHandler) {
+  public Future<Map<K, V>> entries() {
+    Promise<Set<K>> keysPromise = ((VertxInternal)vertx).getOrCreateContext().promise();
+    keys(keysPromise);
+    return keysPromise.future().map(ArrayList::new).compose(keys -> {
+      List<Future> futures = new ArrayList<>(keys.size());
+      for (K k : keys) {
+        Promise valuePromise = Promise.promise();
+        get(k, valuePromise);
+        futures.add(valuePromise.future());
+      }
+      return CompositeFuture.all(futures).map(compositeFuture -> {
+        Map<K, V> map = new HashMap<>();
+        for (int i = 0; i < compositeFuture.size(); i++) {
+          map.put(keys.get(i), compositeFuture.resultAt(i));
+        }
+        return map;
+      });
+    });
+  }
+
+  @Override
+  String keyPath(K k) {
     try {
-      curator.getChildren().inBackground((client, event) ->
-        vertx.runOnContext(aVoid -> resultHandler.handle(Future.succeededFuture(event.getChildren().size()))))
-        .forPath(mapPath);
-    } catch (Exception e) {
-      resultHandler.handle(Future.failedFuture(e));
+      return keyPathPrefix() + Base64.getUrlEncoder().encodeToString(asByte(k));
+    } catch (IOException e) {
+      throw new RuntimeException(e);
     }
   }
 
+  private String keyPathPrefix() {
+    return mapPath + "/";
+  }
 }

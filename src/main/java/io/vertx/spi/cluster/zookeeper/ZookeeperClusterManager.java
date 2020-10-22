@@ -15,21 +15,16 @@
  */
 package io.vertx.spi.cluster.zookeeper;
 
-import io.vertx.core.AsyncResult;
-import io.vertx.core.Handler;
-import io.vertx.core.Vertx;
-import io.vertx.core.VertxException;
-import io.vertx.core.impl.ContextImpl;
+import io.vertx.core.*;
+import io.vertx.core.impl.logging.Logger;
+import io.vertx.core.impl.logging.LoggerFactory;
 import io.vertx.core.json.JsonObject;
-import io.vertx.core.logging.Logger;
-import io.vertx.core.logging.LoggerFactory;
 import io.vertx.core.shareddata.AsyncMap;
 import io.vertx.core.shareddata.Counter;
 import io.vertx.core.shareddata.Lock;
 import io.vertx.core.spi.cluster.AsyncMultiMap;
 import io.vertx.core.spi.cluster.ClusterManager;
 import io.vertx.core.spi.cluster.NodeListener;
-import io.vertx.spi.cluster.zookeeper.impl.AsyncMapTTLMonitor;
 import io.vertx.spi.cluster.zookeeper.impl.ZKAsyncMap;
 import io.vertx.spi.cluster.zookeeper.impl.ZKAsyncMultiMap;
 import io.vertx.spi.cluster.zookeeper.impl.ZKSyncMap;
@@ -52,6 +47,8 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
@@ -68,6 +65,7 @@ public class ZookeeperClusterManager implements ClusterManager, PathChildrenCach
   private NodeListener nodeListener;
   private PathChildrenCache clusterNodes;
   private volatile boolean active;
+  private volatile boolean joined;
 
   private String nodeID;
   private CuratorFramework curator;
@@ -86,6 +84,9 @@ public class ZookeeperClusterManager implements ClusterManager, PathChildrenCach
   private static final String ZK_PATH_COUNTERS = "/counters/";
   private static final String ZK_PATH_CLUSTER_NODE = "/cluster/nodes/";
   private static final String ZK_PATH_CLUSTER_NODE_WITHOUT_SLASH = "/cluster/nodes";
+  private static final String VERTX_HA_NODE = "__vertx.haInfo";
+
+  private ExecutorService lockReleaseExec;
 
   public ZookeeperClusterManager() {
     String resourceLocation = System.getProperty(ZK_SYS_CONFIG_KEY, CONFIG_FILE);
@@ -192,12 +193,11 @@ public class ZookeeperClusterManager implements ClusterManager, PathChildrenCach
   }
 
   @Override
-  public <K, V> void getAsyncMap(String name, Handler<AsyncResult<AsyncMap<K, V>>> handler) {
-    AsyncMapTTLMonitor<K, V> asyncMapTTLMonitor = AsyncMapTTLMonitor.getInstance(vertx, this);
-    vertx.executeBlocking(event -> {
-      AsyncMap zkAsyncMap = asyncMapCache.computeIfAbsent(name, key -> new ZKAsyncMap<>(vertx, curator, asyncMapTTLMonitor, name));
+  public <K, V> Future<AsyncMap<K, V>> getAsyncMap(String name) {
+    return vertx.executeBlocking(event -> {
+      AsyncMap zkAsyncMap = asyncMapCache.computeIfAbsent(name, key -> new ZKAsyncMap<>(vertx, curator, name));
       event.complete(zkAsyncMap);
-    }, handler);
+    });
   }
 
   @Override
@@ -206,10 +206,8 @@ public class ZookeeperClusterManager implements ClusterManager, PathChildrenCach
   }
 
   @Override
-  public void getLockWithTimeout(String name, long timeout, Handler<AsyncResult<Lock>> resultHandler) {
-    ContextImpl context = (ContextImpl) vertx.getOrCreateContext();
-    // Ordered on the internal blocking executor
-    context.executeBlocking(() -> {
+  public Future<Lock> getLockWithTimeout(String name, long timeout) {
+    return vertx.executeBlocking(fut -> {
       ZKLock lock = locks.get(name);
       if (lock == null) {
         InterProcessSemaphoreMutex mutexLock = new InterProcessSemaphoreMutex(curator, ZK_PATH_LOCKS + name);
@@ -218,26 +216,26 @@ public class ZookeeperClusterManager implements ClusterManager, PathChildrenCach
       try {
         if (lock.getLock().acquire(timeout, TimeUnit.MILLISECONDS)) {
           locks.putIfAbsent(name, lock);
-          return lock;
+          fut.complete(lock);
         } else {
           throw new VertxException("Timed out waiting to get lock " + name);
         }
       } catch (Exception e) {
         throw new VertxException("get lock exception", e);
       }
-    }, resultHandler);
+    }, false);
   }
 
   @Override
-  public void getCounter(String name, Handler<AsyncResult<Counter>> resultHandler) {
-    vertx.executeBlocking(future -> {
+  public Future<Counter> getCounter(String name) {
+    return vertx.executeBlocking(future -> {
       try {
         Objects.requireNonNull(name);
         future.complete(new ZKCounter(name, retryPolicy));
       } catch (Exception e) {
         future.fail(new VertxException(e));
       }
-    }, resultHandler);
+    });
   }
 
   @Override
@@ -261,10 +259,36 @@ public class ZookeeperClusterManager implements ClusterManager, PathChildrenCach
     try {
       clusterNodes.start(PathChildrenCache.StartMode.BUILD_INITIAL_CACHE);
       //Join to the cluster
-      curator.create().withMode(CreateMode.EPHEMERAL).forPath(ZK_PATH_CLUSTER_NODE + nodeID, nodeID.getBytes());
+      createThisNode();
+      joined = true;
     } catch (Exception e) {
       throw new VertxException(e);
     }
+  }
+
+  private void createThisNode() throws Exception {
+    //clean ha node would be happened multi times with multi vertx node in startup, so we have a lock to avoid conflict.
+    long onComplete;
+    this.getLockWithTimeout("__cluster_init_lock", 3000L).onComplete(lockAsyncResult -> {
+      if (lockAsyncResult.succeeded()) {
+        try {
+          //we have to clear `__vertx.haInfo` node if cluster is empty, as __haInfo is PERSISTENT mode, so we can not delete last
+          //child of this path.
+          if (clusterNodes.getCurrentData().size() == 0
+            && curator.checkExists().forPath("/syncMap") != null
+            && curator.checkExists().forPath("/syncMap/" + VERTX_HA_NODE) != null) {
+            getSyncMap(VERTX_HA_NODE).clear();
+          }
+        } catch (Exception ex) {
+          log.error("check zk node failed.", ex);
+        } finally {
+          lockAsyncResult.result().release();
+        }
+      } else {
+        log.error("get cluster init lock failed.", lockAsyncResult.cause());
+      }
+    });
+    curator.create().withMode(CreateMode.EPHEMERAL).forPath(ZK_PATH_CLUSTER_NODE + nodeID, nodeID.getBytes());
   }
 
 
@@ -273,6 +297,8 @@ public class ZookeeperClusterManager implements ClusterManager, PathChildrenCach
     vertx.executeBlocking(future -> {
       if (!active) {
         active = true;
+
+        lockReleaseExec = Executors.newCachedThreadPool(r -> new Thread(r, "vertx-zookeeper-service-release-lock-thread"));
 
         //The curator instance has been passed using the constructor.
         if (customCuratorCluster) {
@@ -332,6 +358,7 @@ public class ZookeeperClusterManager implements ClusterManager, PathChildrenCach
       synchronized (ZookeeperClusterManager.this) {
         if (active) {
           active = false;
+          lockReleaseExec.shutdown();
           try {
             curator.delete().deletingChildrenIfNeeded().inBackground((client, event) -> {
               if (event.getType() == CuratorEventType.DELETE) {
@@ -345,7 +372,6 @@ public class ZookeeperClusterManager implements ClusterManager, PathChildrenCach
                 }
               }
             }).forPath(ZK_PATH_CLUSTER_NODE + nodeID);
-            AsyncMapTTLMonitor.getInstance(vertx, this).stop();
           } catch (Exception e) {
             log.error(e);
             future.fail(e);
@@ -385,6 +411,11 @@ public class ZookeeperClusterManager implements ClusterManager, PathChildrenCach
       case CHILD_UPDATED:
         log.warn("Weird event that update cluster node. path:" + event.getData().getPath());
         break;
+      case CONNECTION_RECONNECTED:
+        if (joined) {
+          createThisNode();
+        }
+        break;
       case CONNECTION_SUSPENDED:
         //just release locks on this node.
         locks.values().forEach(ZKLock::release);
@@ -411,31 +442,46 @@ public class ZookeeperClusterManager implements ClusterManager, PathChildrenCach
     }
 
     @Override
-    public void get(Handler<AsyncResult<Long>> resultHandler) {
-      Objects.requireNonNull(resultHandler);
-      vertx.executeBlocking(future -> {
+    public Future<Long> get() {
+      return vertx.executeBlocking(future -> {
         try {
           future.complete(atomicLong.get().preValue());
         } catch (Exception e) {
           future.fail(new VertxException(e));
         }
-      }, resultHandler);
+      });
+    }
+
+    @Override
+    public void get(Handler<AsyncResult<Long>> resultHandler) {
+      Objects.requireNonNull(resultHandler);
+      get().onComplete(resultHandler);
+    }
+
+    @Override
+    public Future<Long> incrementAndGet() {
+      return increment(true);
     }
 
     @Override
     public void incrementAndGet(Handler<AsyncResult<Long>> resultHandler) {
       Objects.requireNonNull(resultHandler);
-      increment(true, resultHandler);
+      incrementAndGet().onComplete(resultHandler);
+    }
+
+    @Override
+    public Future<Long> getAndIncrement() {
+      return increment(false);
     }
 
     @Override
     public void getAndIncrement(Handler<AsyncResult<Long>> resultHandler) {
-      increment(false, resultHandler);
+      Objects.requireNonNull(resultHandler);
+      getAndIncrement().onComplete(resultHandler);
     }
 
-    private void increment(boolean post, Handler<AsyncResult<Long>> resultHandler) {
-      Objects.requireNonNull(resultHandler);
-      vertx.executeBlocking(future -> {
+    private Future<Long> increment(boolean post) {
+      return vertx.executeBlocking(future -> {
         try {
           long returnValue = 0;
           if (atomicLong.get().succeeded()) returnValue = atomicLong.get().preValue();
@@ -447,13 +493,12 @@ public class ZookeeperClusterManager implements ClusterManager, PathChildrenCach
         } catch (Exception e) {
           future.fail(new VertxException(e));
         }
-      }, resultHandler);
+      });
     }
 
     @Override
-    public void decrementAndGet(Handler<AsyncResult<Long>> resultHandler) {
-      Objects.requireNonNull(resultHandler);
-      vertx.executeBlocking(future -> {
+    public Future<Long> decrementAndGet() {
+      return vertx.executeBlocking(future -> {
         try {
           if (atomicLong.decrement().succeeded()) {
             future.complete(atomicLong.get().postValue());
@@ -463,22 +508,39 @@ public class ZookeeperClusterManager implements ClusterManager, PathChildrenCach
         } catch (Exception e) {
           future.fail(new VertxException(e));
         }
-      }, resultHandler);
+      });
+    }
+
+    @Override
+    public void decrementAndGet(Handler<AsyncResult<Long>> resultHandler) {
+      Objects.requireNonNull(resultHandler);
+      decrementAndGet().onComplete(resultHandler);
+    }
+
+    @Override
+    public Future<Long> addAndGet(long value) {
+      return add(value, true);
     }
 
     @Override
     public void addAndGet(long value, Handler<AsyncResult<Long>> resultHandler) {
-      add(value, true, resultHandler);
+      Objects.requireNonNull(resultHandler);
+      addAndGet(value).onComplete(resultHandler);
+    }
+
+    @Override
+    public Future<Long> getAndAdd(long value) {
+      return add(value, false);
     }
 
     @Override
     public void getAndAdd(long value, Handler<AsyncResult<Long>> resultHandler) {
-      add(value, false, resultHandler);
+      Objects.requireNonNull(resultHandler);
+      getAndAdd(value).onComplete(resultHandler);
     }
 
-    private void add(long value, boolean post, Handler<AsyncResult<Long>> resultHandler) {
-      Objects.requireNonNull(resultHandler);
-      vertx.executeBlocking(future -> {
+    private Future<Long> add(long value, boolean post) {
+      return vertx.executeBlocking(future -> {
         try {
           long returnValue = 0;
           if (atomicLong.get().succeeded()) returnValue = atomicLong.get().preValue();
@@ -490,20 +552,25 @@ public class ZookeeperClusterManager implements ClusterManager, PathChildrenCach
         } catch (Exception e) {
           future.fail(new VertxException(e));
         }
-      }, resultHandler);
+      });
     }
 
     @Override
-    public void compareAndSet(long expected, long value, Handler<AsyncResult<Boolean>> resultHandler) {
-      Objects.requireNonNull(resultHandler);
-      vertx.executeBlocking(future -> {
+    public Future<Boolean> compareAndSet(long expected, long value) {
+      return vertx.executeBlocking(future -> {
         try {
           if (atomicLong.get().succeeded() && atomicLong.get().preValue() == 0) this.atomicLong.initialize(0L);
           future.complete(atomicLong.compareAndSet(expected, value).succeeded());
         } catch (Exception e) {
           future.fail(new VertxException(e));
         }
-      }, resultHandler);
+      });
+    }
+
+    @Override
+    public void compareAndSet(long expected, long value, Handler<AsyncResult<Boolean>> resultHandler) {
+      Objects.requireNonNull(resultHandler);
+      compareAndSet(expected, value).onComplete(resultHandler);
     }
   }
 
@@ -524,14 +591,13 @@ public class ZookeeperClusterManager implements ClusterManager, PathChildrenCach
 
     @Override
     public void release() {
-      vertx.executeBlocking(future -> {
+      lockReleaseExec.execute(() -> {
         try {
           lock.release();
         } catch (Exception e) {
           log.error(e);
         }
-        future.complete();
-      }, false, null);
+      });
     }
   }
 
